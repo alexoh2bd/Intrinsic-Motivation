@@ -22,9 +22,11 @@ def make_env(env_id, args):
     if env_id == "reacher":
         from envs.reacher import Reacher
         env = Reacher(backend="spring")
+        # obs = cos(theta)(2)+sin(2)+tip_pos(3)+tip_vel(3)+target_pos(3) => 13
+        # state (no target) for CRL: first 10 dims; target for goals is [10:13]
         args.obs_dim = 10
-        args.goal_start_idx = 4
-        args.goal_end_idx = 7
+        args.goal_start_idx = 10
+        args.goal_end_idx = 13
 
     elif env_id == "pusher":
         from envs.pusher import Pusher

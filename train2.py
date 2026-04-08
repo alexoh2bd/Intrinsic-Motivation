@@ -20,25 +20,10 @@ from wandb_osh.hooks import TriggerWandbSyncHook
 from flax.training.train_state import TrainState
 from flax.linen.initializers import variance_scaling
 from brax.io import html
-from flax.core import freeze, unfreeze
+from loss import SIGRegModule, lejepa_loss
 
-# ── shared src/ imports ──────────────────────────────────────────────────────
-from src.networks import (
-    lecun_unfirom,
-    bias_init,
-    residual_block,
-    UnifiedEncoder,
-    SA_encoder,
-    G_encoder,
-    Actor,
-)
-from src.types import TrainingState, Transition
-from src.utils import load_params, save_params
-from src.env_factory import make_env as _make_env
-from src.loss import SIGRegModule, lejepa_loss, sigreg_forward, tri_loss
-from src.evaluator import CrlEvaluator
-from src.buffer import TrajectoryUniformSamplingQueue
-
+from evaluator import CrlEvaluator
+from buffer import TrajectoryUniformSamplingQueue
 
 @dataclass
 class Args:
@@ -49,7 +34,7 @@ class Args:
     track: bool = True
     wandb_project_name: str = "JaxGCRL_testing"
     wandb_entity: str = 'aho13-duke-university'
-    wandb_mode: str = 'online'
+    wandb_mode: str = 'offline'
     wandb_dir: str = '.'
     wandb_group: str = '.'
     capture_vis: bool = True
@@ -57,7 +42,7 @@ class Args:
     checkpoint: bool = True
 
     #environment specific arguments
-    env_id: str = "humanoid" # "ant_big_maze" "humanoid_u_maze" "arm_binpick_hard"
+    env_id: str = "humanoid_u_maze"# "humanoid"  "ant_big_maze" "humanoid_u_maze" "arm_binpick_hard"
     episode_length: int = 1000
     # to be filled in runtime
     obs_dim: int = 0
@@ -121,20 +106,166 @@ class Args:
     num_training_steps_per_epoch : int = 0
     """the number of training steps per epoch(computed in runtime)"""
 
-    unified_encoder: bool = False  # Use UnifiedEncoder for critic (shared trunk, two input projections)
-    sigreg: bool = False            # Use SIGReg/JEPA loss (auto-enables unified_encoder)
+    sigreg: bool = False
     lamb: float = 0.05
 
-    # Actor embedding regularization (SIGReg on backbone output before action heads)
-    actor_embed_reg: bool = False
-    actor_reg_coeff: float = 0.05
 
 
+lecun_unfirom = variance_scaling(1/3, "fan_in", "uniform")
+bias_init = nn.initializers.zeros
+def residual_block(x, width, normalize, activation):
+    identity = x
+    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+    x = normalize(x)
+    x = activation(x)
+    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+    x = normalize(x)
+    x = activation(x)
+    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+    x = normalize(x)
+    x = activation(x)
+    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+    x = normalize(x)
+    x = activation(x)
+    x = x + identity
+    return x
+
+class SA_encoder(nn.Module):
+    norm_type = "layer_norm"
+    network_width: int = 1024
+    network_depth: int = 4
+    skip_connections: int = 0
+    use_relu: int = 0
+    @nn.compact
+    def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
+
+        lecun_unfirom = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+        
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        else:
+            normalize = lambda x: x
+        
+        if self.use_relu:
+            activation = nn.relu
+        else:
+            activation = nn.swish
+            
+        x = jnp.concatenate([s, a], axis=-1)
+        #Initial layer
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x)
+        x = activation(x)
+        #Residual blocks
+        for i in range(self.network_depth // 4):
+            x = residual_block(x, self.network_width, normalize, activation)
+        #Final layer
+        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        return x
+    
+class G_encoder(nn.Module):
+    norm_type = "layer_norm"
+    network_width: int = 1024
+    network_depth: int = 4
+    skip_connections: int = 0
+    use_relu: int = 0
+    @nn.compact
+    def __call__(self, g: jnp.ndarray):
+
+        lecun_unfirom = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        else:
+            normalize = lambda x: x
+        
+        if self.use_relu:
+            activation = nn.relu
+        else:
+            activation = nn.swish
+        
+        x = g
+        #Initial layer
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x)
+        x = activation(x)
+        #Residual blocks
+        for i in range(self.network_depth // 4):
+            x = residual_block(x, self.network_width, normalize, activation)
+        #Final layer
+        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        return x
+  
+class Actor(nn.Module):
+    action_size: int
+    norm_type = "layer_norm"
+    network_width: int = 1024
+    network_depth: int = 4
+    skip_connections: int = 0
+    use_relu: int = 0
+    LOG_STD_MAX = 2
+    LOG_STD_MIN = -5
+
+    @nn.compact
+    def __call__(self, x):
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        else:
+            normalize = lambda x: x
+            
+        if self.use_relu:
+            activation = nn.relu
+        else:
+            activation = nn.swish
+
+        lecun_unfirom = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+    
+        #Initial layer
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x)
+        x = activation(x)
+        #Residual blocks
+        for i in range(self.network_depth // 4):
+            x = residual_block(x, self.network_width, normalize, activation)
+        #Final layer
+        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        
+        log_std = nn.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
+
+        return mean, log_std
 
 
-# Network classes (UnifiedEncoder, SA_encoder, G_encoder, Actor),
-# TrainingState, Transition, load_params, save_params, residual_block,
-# lecun_unfirom, bias_init  — all imported from src/ above.
+@flax.struct.dataclass
+class TrainingState:
+    """Contains training state for the learner"""
+    env_steps: jnp.ndarray
+    gradient_steps: jnp.ndarray
+    actor_state: TrainState
+    critic_state: TrainState
+    alpha_state: TrainState
+
+class Transition(NamedTuple):
+    """Container for a transition"""
+    observation: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    discount: jnp.ndarray
+    extras: jnp.ndarray = ()
+
+def load_params(path: str):
+    with epath.Path(path).open('rb') as fin:
+        buf = fin.read()
+    return pickle.loads(buf)
+
+def save_params(path: str, params: Any):
+    """Saves parameters in flax format."""
+    with epath.Path(path).open('wb') as fout:
+        fout.write(pickle.dumps(params))
 
 if __name__ == "__main__":
 
@@ -158,14 +289,7 @@ if __name__ == "__main__":
     args.num_training_steps_per_epoch = (args.total_env_steps - args.num_prefill_env_steps) // (args.num_epochs * args.env_steps_per_actor_step)
     print(f"num_training_steps_per_epoch: {args.num_training_steps_per_epoch}", flush=True)
 
-    # SIGReg loss requires the unified encoder; auto-enable for backward compat
-    if args.sigreg and not args.unified_encoder:
-        print("NOTE: --sigreg requires --unified_encoder; enabling unified_encoder automatically.", flush=True)
-        args.unified_encoder = True
-
-    encoder_tag = "unified" if args.unified_encoder else "separate"
-    loss_tag = "sigreg" if args.sigreg else "infonce"
-    sigma = f"{encoder_tag}_{loss_tag}"
+    sigma="sigreg" if args.sigreg else "infonce"
     run_name = f"{args.env_id}{'_' + args.eval_env_id if args.eval_env_id else ''}_{args.batch_size}_{args.total_env_steps}_nenvs:{args.num_envs}_criticwidth:{args.critic_network_width}_actorwidth:{args.actor_network_width}_criticdepth:{args.critic_depth}_actordepth:{args.actor_depth}_actorskip:{args.actor_skip_connections}_criticskip:{args.critic_skip_connections}_{args.seed}_{sigma}"
     print(f"run_name: {run_name}", flush=True)
     
@@ -202,10 +326,191 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, buffer_key, env_key, eval_env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
 
-    # Use shared env factory from src/
     def make_env(env_id=args.env_id):
-        return _make_env(env_id, args)
+        print(f"making env with env_id: {env_id}", flush=True)
+        if env_id == "reacher":
+            from envs.reacher import Reacher
+            env = Reacher(
+                backend="spring",
+            )
+            # Match envs/reacher._get_obs: target is last 3 dims (see src/env_factory.py)
+            args.obs_dim = 10
+            args.goal_start_idx = 10
+            args.goal_end_idx = 13
+        elif env_id == "pusher":
+            from envs.pusher import Pusher
+            env = Pusher(
+                backend="spring",
+            )
+            args.obs_dim = 20
+            args.goal_start_idx = 10
+            args.goal_end_idx = 13
+        elif env_id == "ant":
+            from envs.ant import Ant
+            env = Ant(
+                backend="spring",
+                exclude_current_positions_from_observation=False,
+                terminate_when_unhealthy=True,
+            )
 
+            args.obs_dim = 29
+            args.goal_start_idx = 0
+            args.goal_end_idx = 2
+
+        elif "ant" in env_id and "maze" in env_id: #needed the add the ant check to differentiate with humanoid maze
+            if "gen" not in env_id:
+                from envs.ant_maze import AntMaze
+                env = AntMaze(
+                    backend="spring",
+                    exclude_current_positions_from_observation=False,
+                    terminate_when_unhealthy=True,
+                    maze_layout_name=env_id[4:]
+                )
+
+                args.obs_dim = 29
+                args.goal_start_idx = 0
+                args.goal_end_idx = 2
+            else:
+                from envs.ant_maze_generalization import AntMazeGeneralization
+                gen_idx = env_id.find("gen")
+                maze_layout_name = env_id[4:gen_idx-1]
+                generalization_config = env_id[gen_idx+4:]
+                print(f"maze_layout_name: {maze_layout_name}, generalization_config: {generalization_config}", flush=True)
+                env = AntMazeGeneralization(
+                    backend="spring",
+                    exclude_current_positions_from_observation=False,
+                    terminate_when_unhealthy=True,
+                    maze_layout_name=maze_layout_name,
+                    generalization_config=generalization_config
+                )
+
+                args.obs_dim = 29
+                args.goal_start_idx = 0
+                args.goal_end_idx = 2
+        
+        elif env_id == "ant_ball":
+            from envs.ant_ball import AntBall
+            env = AntBall(
+                backend="spring",
+                exclude_current_positions_from_observation=False,
+                terminate_when_unhealthy=True,
+            )
+
+            args.obs_dim = 31
+            args.goal_start_idx = 28
+            args.goal_end_idx = 30
+
+        elif env_id == "ant_push":
+            from envs.ant_push import AntPush
+            env = AntPush(
+                backend="mjx",
+            )
+
+            args.obs_dim = 31
+            args.goal_start_idx = 0
+            args.goal_end_idx = 2
+            
+        elif env_id == "humanoid":
+            from envs.humanoid import Humanoid
+            env = Humanoid(
+                backend="spring",
+                exclude_current_positions_from_observation=False,
+                terminate_when_unhealthy=True,
+            )
+
+            args.obs_dim = 268
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+            
+        elif "humanoid" in env_id and "maze" in env_id:
+            from envs.humanoid_maze import HumanoidMaze
+            env = HumanoidMaze(
+                backend="spring",
+                maze_layout_name=env_id[9:]
+            )
+
+            args.obs_dim = 268
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+
+            
+        elif env_id == "arm_reach":
+            from envs.manipulation.arm_reach import ArmReach
+            env = ArmReach(
+                backend="mjx",
+            )
+
+            args.obs_dim = 13
+            args.goal_start_idx = 7
+            args.goal_end_idx = 10
+            
+        elif env_id == "arm_binpick_easy":
+            from envs.manipulation.arm_binpick_easy import ArmBinpickEasy
+            env = ArmBinpickEasy(
+                backend="mjx",
+            )
+
+            args.obs_dim = 17
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+            
+        elif env_id == "arm_binpick_hard":
+            from envs.manipulation.arm_binpick_hard import ArmBinpickHard
+            env = ArmBinpickHard(
+                backend="mjx",
+            )
+
+            args.obs_dim = 17
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+            
+        elif env_id == "arm_binpick_easy_EEF":
+            from envs.manipulation.arm_binpick_easy_EEF import ArmBinpickEasyEEF
+            env = ArmBinpickEasyEEF(
+                backend="mjx",
+            )
+
+            args.obs_dim = 11
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+        
+        elif "arm_grasp" in env_id: # either arm_grasp or arm_grasp_0.5, etc
+            from envs.manipulation.arm_grasp import ArmGrasp
+            cube_noise_scale = float(env_id[10:]) if len(env_id) > 9 else 0.3
+            env = ArmGrasp(
+                cube_noise_scale=cube_noise_scale,
+                backend="mjx",
+            )
+
+            args.obs_dim = 23
+            args.goal_start_idx = 16
+            args.goal_end_idx = 23
+        
+        elif env_id == "arm_push_easy":
+            from envs.manipulation.arm_push_easy import ArmPushEasy
+            env = ArmPushEasy(
+                backend="mjx",
+            )
+
+            args.obs_dim = 17
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+        
+        elif env_id == "arm_push_hard":
+            from envs.manipulation.arm_push_hard import ArmPushHard
+            env = ArmPushHard(
+                backend="mjx",
+            )
+
+            args.obs_dim = 17
+            args.goal_start_idx = 0
+            args.goal_end_idx = 3
+
+        else:
+            raise NotImplementedError
+        
+        return env
+        
     env = make_env()
     env = envs.training.wrap(
         env,
@@ -244,68 +549,24 @@ if __name__ == "__main__":
         tx=optax.adam(learning_rate=args.actor_lr)
     )
 
-    # Actor embedding SIGReg params (separate from critic's sigreg_params)
-    if args.actor_embed_reg:
-        sigreg_params_actor = SIGRegModule.init_sigreg_params(knots=17)
-
-    # Critic — architecture choice (unified vs. separate encoders)
-    if args.unified_encoder:
-        # Unified encoder for both goals and state-actions
-        u_encoder = UnifiedEncoder(
-            network_width=args.critic_network_width, 
-            network_depth=args.critic_depth, 
-            skip_connections=args.critic_skip_connections, 
-            use_relu=args.use_relu
-        )
-        # Initialize BOTH projection paths by tracing each input_type separately
-        # This ensures both goal_projection and sa_projection layers are created
-        sa_key, g_init_key = jax.random.split(sa_key)
-        
-        # First init: trace state-action path
-        sa_params = u_encoder.init(
-            sa_key, 
-            np.ones([1, args.obs_dim + action_size]),
-            input_type="state_action"
-        )
-        
-        # Second init: trace goal path
-        g_params = u_encoder.init(
-            g_init_key, 
-            np.ones([1, args.goal_end_idx - args.goal_start_idx]),
-            input_type="goal"
-        )
-        
-        # Merge params: sa_params has sa_projection, g_params has goal_projection
-        merged_params = {**unfreeze(sa_params)['params'], **unfreeze(g_params)['params']}
-        u_encoder_params = freeze({'params': merged_params})
-        
-        critic_state = TrainState.create(
-            apply_fn=None,
-            params={"u_encoder": u_encoder_params},
-            tx=optax.adam(learning_rate=args.critic_lr),
-        )
-    else:
-        sa_encoder = SA_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
-        sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
-        g_encoder = G_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
-        g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
-    
-        critic_state = TrainState.create(
-            apply_fn=None,
-            params={
-                "sa_encoder": sa_encoder_params, 
-                "g_encoder": g_encoder_params
-                },
-            tx=optax.adam(learning_rate=args.critic_lr),
-        )
-
-    # SIGReg loss params (only needed when using SIGReg/JEPA loss)
+    # Critic
+    sa_encoder = SA_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
+    sa_encoder_params = sa_encoder.init(sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size]))
+    g_encoder = G_encoder(network_width=args.critic_network_width, network_depth=args.critic_depth, skip_connections=args.critic_skip_connections, use_relu=args.use_relu)
+    g_encoder_params = g_encoder.init(g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx]))
     if args.sigreg:
+        # Initialize SIGReg parameters using static method (returns correct dict format)
         global sigreg_params
         sigreg_params = SIGRegModule.init_sigreg_params(knots=17)
-
-    # SIGReg params for the actor JEPA loss (separate from critic's sigreg_params)
-    # sigreg_params_actor = SIGRegModule.init_sigreg_params(knots=17)
+    
+    critic_state = TrainState.create(
+        apply_fn=None,
+        params={
+            "sa_encoder": sa_encoder_params, 
+            "g_encoder": g_encoder_params
+            },
+        tx=optax.adam(learning_rate=args.critic_lr),
+    )
 
     # Entropy coefficient
     target_entropy = -args.entropy_param * action_size # action_size = 8 for ant, 17 for humanoid, etc
@@ -359,7 +620,7 @@ if __name__ == "__main__":
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
-        means, _, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
         actions = nn.tanh( means )
 
         nstate = env.step(env_state, actions)
@@ -374,7 +635,7 @@ if __name__ == "__main__":
         )
     
     def actor_step(training_state, env, env_state, key, extra_fields):
-        means, log_stds, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
         stds = jnp.exp(log_stds)
         actions = nn.tanh( means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype) )
 
@@ -392,8 +653,7 @@ if __name__ == "__main__":
     def multi_sample_actor_step(training_state, env, env_state, key, K, extra_fields):
         # Get K sets of actions from the actor
         keys = jax.random.split(key, K)
-        
-        means, log_stds, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
         stds = jnp.exp(log_stds)
         
         actions = jnp.stack([
@@ -403,34 +663,19 @@ if __name__ == "__main__":
         
         state = env_state.obs[:, :args.obs_dim]
         goal = env_state.obs[:, args.obs_dim:]
-
-        if args.unified_encoder:
-            # Unified encoder: encode goals and state-actions with same encoder
-            g_repr = u_encoder.apply(
-                training_state.critic_state.params["u_encoder"], 
-                goal,
-                input_type="goal"
+        
+        sa_reprs = jax.vmap(
+            lambda a: sa_encoder.apply(
+                training_state.critic_state.params["sa_encoder"], 
+                state, 
+                a
             )
-            sa_reprs = jax.vmap(
-                lambda a: u_encoder.apply(
-                    training_state.critic_state.params["u_encoder"], 
-                    jnp.concatenate([state, a], axis=-1),
-                    input_type="state_action"
-                )
-            )(actions)
-            
-        else:
-            g_repr = g_encoder.apply(
-                training_state.critic_state.params["g_encoder"], 
-                goal
-            ) 
-            sa_reprs = jax.vmap(
-                lambda a: sa_encoder.apply(
-                    training_state.critic_state.params["sa_encoder"], 
-                    state, 
-                    a
-                )
-            )(actions)
+        )(actions)
+        
+        g_repr = g_encoder.apply(
+            training_state.critic_state.params["g_encoder"], 
+            goal
+        ) 
 
         q_values = -jnp.sqrt(
             jnp.sum((sa_reprs - g_repr) ** 2, axis=-1)
@@ -504,57 +749,36 @@ if __name__ == "__main__":
             transitions
         )
         def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
+            """
+
+            """
+
             obs = transitions.observation           # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, :args.obs_dim]
             future_state = transitions.extras["future_state"]
             goal = future_state[:, args.goal_start_idx : args.goal_end_idx]
             observation = jnp.concatenate([state, goal], axis=1)
 
-            key, sample_key, sig_key1, sig_key2 = jax.random.split(key, 4)
-
-            means, log_stds, actor_embedding = actor.apply(actor_params, observation)
+            means, log_stds = actor.apply(actor_params, observation)
             stds = jnp.exp(log_stds)
-            x_ts = means + stds * jax.random.normal(sample_key, shape=means.shape, dtype=means.dtype)
+            x_ts = means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
             action = nn.tanh(x_ts)
             log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)           # dimension = B
 
-            if args.unified_encoder:
-                # Unified encoder
-                sa_repr = u_encoder.apply(
-                    critic_params["u_encoder"], 
-                    jnp.concatenate([state, action], axis=-1),
-                    input_type="state_action"
-                )
-                g_repr = u_encoder.apply(
-                    critic_params["u_encoder"], 
-                    goal,
-                    input_type="goal"
-                )
-            else:
-                sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
-                sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
-                g_repr = g_encoder.apply(g_encoder_params, goal)
+            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            g_repr = g_encoder.apply(g_encoder_params, goal)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
 
-            # Actor loss: maximise Q (minimise distance)
-            actor_loss = -jnp.mean(qf_pi)
+            if args.disable_entropy:
+                actor_loss = -jnp.mean(qf_pi)
+            else:
+                actor_loss = jnp.mean( jnp.exp(log_alpha) * log_prob - (qf_pi) )
 
-            # Actor embedding SIGReg: diversify backbone representations
-            # before the action heads to prevent embedding collapse
-            actor_sigreg_loss = jnp.float32(0.0)
-            if args.actor_embed_reg:
-                actor_sigreg_loss = sigreg_forward(
-                    actor_embedding, sigreg_params_actor, sig_key1
-                )
-                actor_loss = actor_loss + args.actor_reg_coeff * actor_sigreg_loss
-
-            if not args.disable_entropy:
-                actor_loss = actor_loss + jnp.mean(jnp.exp(log_alpha) * log_prob)
-
-            return actor_loss, (log_prob, actor_sigreg_loss)
+            return actor_loss, log_prob
 
         def alpha_loss(alpha_params, log_prob):
             '''
@@ -565,7 +789,7 @@ if __name__ == "__main__":
             alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - target_entropy))
             return jnp.mean(alpha_loss)
         
-        (actorloss, (log_prob, actor_sigreg_loss)), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(training_state.actor_state.params, training_state.critic_state.params, training_state.alpha_state.params['log_alpha'], transitions, key)
+        (actorloss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(training_state.actor_state.params, training_state.critic_state.params, training_state.alpha_state.params['log_alpha'], transitions, key)
         new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
 
         alphaloss, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
@@ -578,7 +802,6 @@ if __name__ == "__main__":
             "actor_loss": actorloss,
             "alph_aloss": alphaloss,   
             "log_alpha": training_state.alpha_state.params["log_alpha"],
-            "actor_sigreg_loss": actor_sigreg_loss,
         }
 
         return training_state, metrics
@@ -591,55 +814,47 @@ if __name__ == "__main__":
             transitions
         )
         def critic_loss(critic_params, transitions, key):
-            obs = transitions.observation[:, :args.obs_dim]      
-            action = transitions.action                          
-            goal = transitions.observation[:, args.obs_dim:]     
+            
+            
+            sa_encoder_params, g_encoder_params = critic_params["sa_encoder"], critic_params["g_encoder"]
+            obs = transitions.observation[:, :args.obs_dim]
+            action = transitions.action
+            
+            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
+            g_repr = g_encoder.apply(g_encoder_params, transitions.observation[:, args.obs_dim:])
+            
+            # if args.sigreg:
+            #     # lamb = args.lamb* min(1.0, training_steps / warmup_steps)
+            #     critic_loss, sim_loss, sigreg_loss = lejepa_loss(
+            #         g_repr, sa_repr, sigreg_params, lamb=args.lamb, rng=key, M=256
+            #     )
+            #     # Compute logits for logsumexp penalty (pairwise distances like InfoNCE)
+            #     logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+            #     critic_loss += -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
 
-            # Step A: Encoder forward — architecture choice
-            if args.unified_encoder:
-                u_encoder_params = critic_params["u_encoder"]
-                sa_repr = u_encoder.apply(
-                    u_encoder_params, 
-                    jnp.concatenate([obs, action], axis=-1),
-                    input_type="state_action"
-                )
-                g_repr = u_encoder.apply(
-                    u_encoder_params, 
-                    goal,
-                    input_type="goal"
-                )
-            else:
-                sa_repr = sa_encoder.apply(critic_params["sa_encoder"], obs, action)
-                g_repr = g_encoder.apply(critic_params["g_encoder"], goal)
-
-            # Step B: Loss computation — loss function choice
-            if args.sigreg:
-                critic_loss, sim_loss, sigreg_loss = lejepa_loss(
-                    g_repr, sa_repr, sigreg_params, lamb=args.lamb, rng=key, M=256
-                )
-                # InfoNCE
-                logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
-                critic_loss += -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
-
-                logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-                critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
+            #     logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+            #     critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
                 
-            else:
+            # else:
                 # InfoNCE
-                logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
-                critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
-                
-                logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-                critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
-                sim_loss = jnp.zeros(()) 
-                sigreg_loss = jnp.zeros(())  
-
+            logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+            
+            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
+            # lejepa_loss, sim_loss, sigreg_loss = lejepa_loss(
+            #     g_repr, sa_repr, sigreg_params, lamb=args.lamb, rng=key, M=256
+            # )
+            # Set to zeros for InfoNCE (not applicable)
+            sim_loss = jnp.zeros(()) 
+            sigreg_loss = jnp.zeros(())  
             aux_metrics = {
+                'logsumexp': logsumexp.mean() if logsumexp.ndim > 0 else logsumexp,
                 'I': jnp.zeros(()),
                 'correct': jnp.zeros(()),
                 'logits_pos': jnp.zeros(()),
                 'logits_neg': jnp.zeros(()),
-                'sim_loss' : sim_loss,
+                'sim_loss': sim_loss,
                 'sigreg_loss': sigreg_loss
             }
             return critic_loss, aux_metrics
@@ -656,9 +871,9 @@ if __name__ == "__main__":
                 "categorical_accuracy": aux_metrics['correct'],
                 "logits_pos": aux_metrics['logits_pos'],
                 "logits_neg": aux_metrics['logits_neg'],
-                # "logsumexp": aux_metrics['logsumexp'],
-                'sim_loss': aux_metrics['sim_loss'],
+                "logsumexp": aux_metrics['logsumexp'],
                 "critic_loss": loss,
+                "sim_loss": aux_metrics['sim_loss'],
                 "sigreg_loss": aux_metrics['sigreg_loss'],
             }
         else:
@@ -666,7 +881,7 @@ if __name__ == "__main__":
                 "categorical_accuracy": aux_metrics['correct'],
                 "logits_pos": aux_metrics['logits_pos'],
                 "logits_neg": aux_metrics['logits_neg'],
-                # "logsumexp": aux_metrics['logsumexp'],
+                "logsumexp": aux_metrics['logsumexp'],
                 "critic_loss": loss,
             }
 
@@ -856,14 +1071,11 @@ if __name__ == "__main__":
         print(f"epoch {ne} out of {args.num_epochs} complete. metrics: {metrics}", flush=True)
 
         if args.checkpoint:
-
             if ne < 5 or ne >= args.num_epochs - 5 or ne % 10 == 0:
                 # Save current policy and critic params.
                 params = (training_state.alpha_state.params, training_state.actor_state.params, training_state.critic_state.params)
                 path = f"{save_path}/step_{int(training_state.env_steps)}.pkl"
                 save_params(path, params)
-                jax.clear_caches()
-
         
         if args.track:
             wandb.log(metrics, step=ne)
@@ -887,7 +1099,7 @@ if __name__ == "__main__":
             """Renders the policy and saves it as an HTML file."""
             @jax.jit
             def policy_step(env_state, actor_params):
-                means, _, _ = actor.apply(actor_params, env_state.obs)
+                means, _ = actor.apply(actor_params, env_state.obs)
                 actions = nn.tanh(means)
                 next_state = env.step(env_state, actions)
                 return next_state, env_state 
