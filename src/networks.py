@@ -12,7 +12,7 @@ Contains:
 import flax.linen as nn
 import jax.numpy as jnp
 from flax.linen.initializers import variance_scaling
-from src.loss import lejepa_loss, SIGRegModule
+from src.loss import SIGRegModule
 
 
 lecun_unfirom = variance_scaling(1/3, "fan_in", "uniform")
@@ -199,6 +199,59 @@ class Actor(nn.Module):
         log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std, embedding
+
+
+
+
+
+class ISOActor(nn.Module):
+    """Shared-trunk PPO actor-critic with exposed trunk embedding for SIGReg."""
+    action_size: int
+    norm_type = "layer_norm"
+    network_width: int = 1024
+    network_depth: int = 16
+    skip_connections: int = 0
+    use_relu: int = 0
+    LOG_STD_MAX = 2
+    LOG_STD_MIN = -5
+
+    @nn.compact
+    def __call__(self, x):
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        else:
+            normalize = lambda x: x
+
+        if self.use_relu:
+            activation = nn.relu
+        else:
+            activation = nn.swish
+
+        lecun_unfirom = variance_scaling(1/3, "fan_in", "uniform")
+        bias_init = nn.initializers.zeros
+
+        # Initial layer
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x)
+        x = activation(x)
+        # Residual blocks
+        for _ in range(self.network_depth // 4):
+            x = residual_block(x, self.network_width, normalize, activation)
+
+        trunk_embedding = x
+
+        # Actor head
+        mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        log_std = nn.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+
+        # Value head
+        value = nn.Dense(1, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        value = jnp.squeeze(value, axis=-1)
+
+        return mean, log_std, value, trunk_embedding
+
 
 
 class ShallowActor(nn.Module):

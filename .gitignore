@@ -10,3 +10,8 @@ uv.lock
 *.sh
 /logs
 *.pdf
+/data
+/.cursor
+/lewm
+/IsoGaussian-DRL
+slurm*

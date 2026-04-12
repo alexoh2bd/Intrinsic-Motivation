@@ -17,6 +17,14 @@ class TrainingState:
     alpha_state: TrainState
 
 
+@flax.struct.dataclass
+class ISOTrainingState:
+    """Training state for shared-trunk PPO (no separate critic or alpha)."""
+    env_steps: jnp.ndarray
+    gradient_steps: jnp.ndarray
+    actor_state: TrainState
+
+
 class Transition(NamedTuple):
     """Container for a transition"""
     observation: jnp.ndarray

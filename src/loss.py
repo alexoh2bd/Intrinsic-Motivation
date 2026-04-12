@@ -5,6 +5,7 @@ SIGReg (LeJEPA)
 VICReg
 INFO_NCE (SimCLR)
 """
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -106,6 +107,50 @@ def sigreg_forward(
 
 
 
+def sigreg_iso(
+    embeddings: jnp.ndarray,
+    rng: jax.random.PRNGKey,
+    num_slices: int = 16,
+    num_t: int = 8,
+    t_max: float = 5.0,
+) -> jnp.ndarray:
+    """SIGReg matching IsoGaussian-DRL: symmetric t-grid, no batch-size scaling.
+
+    Pushes the marginal distribution of 1-D sliced projections toward N(0,1)
+    by matching the empirical characteristic function to exp(-t^2/2).
+
+    Args:
+        embeddings: (B, D) batch of embeddings.
+        rng: JAX PRNG key.
+        num_slices: number of random unit-norm projection directions.
+        num_t: number of evaluation points on the t-grid.
+        t_max: grid spans [-t_max, t_max].
+
+    Returns:
+        Scalar loss (averaged over t-grid points).
+    """
+    B, D = embeddings.shape
+    a = random.normal(rng, (num_slices, D))
+    a = a / (jnp.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
+    s = embeddings @ a.T  # (B, num_slices)
+
+    t_grid = jnp.linspace(-t_max, t_max, num_t)
+
+    loss = jnp.float32(0.0)
+    for i in range(num_t):
+        tt = t_grid[i]
+        cos_ts = jnp.cos(tt * s)   # (B, num_slices)
+        sin_ts = jnp.sin(tt * s)
+        re = cos_ts.mean(axis=0)    # (num_slices,)
+        im = sin_ts.mean(axis=0)
+        target = jnp.exp(-0.5 * tt ** 2)
+        re_loss = jnp.mean((re - target) ** 2)
+        im_loss = jnp.mean(im ** 2)
+        loss = loss + re_loss + im_loss
+
+    return loss / num_t
+
+
 # Distributed training helpers
 def all_reduce_mean(x: jnp.ndarray) -> jnp.ndarray:
     """
@@ -134,33 +179,37 @@ class SIGRegModule(nn.Module):
     knots: int = 17
     
     def setup(self):
-        # Initialize buffers as Flax variables (not trainable params)
-        t = jnp.linspace(0, 3, self.knots, dtype=jnp.float32)
-        dt = 3 / (self.knots - 1)
-        weights = jnp.full((self.knots,), 2 * dt, dtype=jnp.float32)
-        weights = weights.at[0].set(dt)
-        weights = weights.at[-1].set(dt)
-        window = jnp.exp(-jnp.square(t) / 2.0)
-        
+        # Initialize buffers as Flax variables (not trainable params).
+        # Use NumPy for static grids so import/init does not trigger GPU PTX compilation (needs ptxas).
+        t_np = np.linspace(0, 3, self.knots, dtype=np.float32)
+        dt = np.float32(3 / (self.knots - 1))
+        weights_np = np.full((self.knots,), 2 * dt, dtype=np.float32)
+        weights_np[0] = dt
+        weights_np[-1] = dt
+        window_np = np.exp(-np.square(t_np) / 2.0)
+        combined_np = weights_np * window_np
+        t = jnp.asarray(t_np)
+        phi = jnp.asarray(window_np)
+        w = jnp.asarray(combined_np)
         # Register as Flax variables in 'sigreg_buffers' collection
         self.t = self.variable('sigreg_buffers', 't', lambda: t)
-        self.phi = self.variable('sigreg_buffers', 'phi', lambda: window)
-        self.weights = self.variable('sigreg_buffers', 'weights', lambda: weights * window)
+        self.phi = self.variable('sigreg_buffers', 'phi', lambda: phi)
+        self.weights = self.variable('sigreg_buffers', 'weights', lambda: w)
 
     @staticmethod
     def init_sigreg_params(knots: int = 17) -> dict:
         """Initialize SIGReg parameters (buffers) - static method for direct usage"""
-        t = jnp.linspace(0, 3, knots, dtype=jnp.float32)
-        dt = 3 / (knots - 1)
-        weights = jnp.full((knots,), 2 * dt, dtype=jnp.float32)
-        weights = weights.at[0].set(dt)
-        weights = weights.at[-1].set(dt)
-        window = jnp.exp(-jnp.square(t) / 2.0)
-        
+        t = np.linspace(0, 3, knots, dtype=np.float32)
+        dt = np.float32(3 / (knots - 1))
+        weights = np.full((knots,), 2 * dt, dtype=np.float32)
+        weights[0] = dt
+        weights[-1] = dt
+        window = np.exp(-np.square(t) / 2.0)
+        combined = weights * window
         return {
-            't': t,
-            'phi': window,
-            'weights': weights * window
+            't': jnp.asarray(t),
+            'phi': jnp.asarray(window),
+            'weights': jnp.asarray(combined),
         }
     def __call__(self, proj: jnp.ndarray, rng: jax.random.PRNGKey, M: int = 256) -> jnp.ndarray:
         """
