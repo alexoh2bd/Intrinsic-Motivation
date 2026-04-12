@@ -1,0 +1,40 @@
+# Offline W&B + SAC: learned SIGReg on actor trunk, InfoNCE-only critic (no critic SIGReg/JEPA).
+# Compare to humanoid_iso.yaml (online + iso_actor / isotropic Gaussian on actor).
+slurm:
+  job_name: jaxgcrl_hum_offline_sa_ic
+  output: logs/%x_%j.log
+  error: logs/%x_%j.err
+  nodes: 1
+  ntasks: 1
+  cpus_per_task: 10
+  mem: 50G
+  time: "48:00:00"
+  partition: compsci-gpu
+  gres: gpu:a5000:1
+
+env:
+  XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
+  JAX_CUDA_ARCH_LIST: "8.6"
+
+args:
+  wandb_mode: offline
+  env_id: humanoid
+  eval_env_id: humanoid
+  num_epochs: 100
+  total_env_steps: 100000000
+  critic_depth: 64
+  actor_depth: 64
+  actor_skip_connections: 4
+  critic_skip_connections: 4
+  critic_network_width: 256
+  actor_network_width: 256
+  batch_size: 512
+  vis_length: 1000
+  save_buffer: 0
+  unified_encoder: true
+  # InfoNCE critic only (not lejepa_loss / critic SIGReg)
+  sigreg: false
+  # Learned SIGReg on actor backbone (sigreg_forward), not iso_actor
+  actor_embed_reg: true
+  iso_actor: false
+  actor_reg_coeff: 0.05

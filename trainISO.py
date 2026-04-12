@@ -23,7 +23,7 @@ from src.env_factory import make_env as _make_env
 from src.loss import sigreg_iso
 from src.evaluator import CrlEvaluator
 from src.networks import ISOActor
-
+# from train import get_experience,
 
 class PPORollout(NamedTuple):
     """On-policy rollout storage for PPO."""
@@ -504,28 +504,27 @@ if __name__ == "__main__":
 
     if args.capture_vis and save_path is not None:
         def render_policy(training_state, save_path_local):
+            """Roll out the policy in fresh eval envs and save Brax HTML (same pattern as train.py)."""
             @jax.jit
             def policy_step(env_state, actor_params):
                 means, _, _, _ = actor.apply(actor_params, env_state.obs)
                 actions = nn.tanh(means)
+                # Must use `env` from render_policy's loop below — not the training `env` in module scope.
                 next_state = env.step(env_state, actions)
                 return next_state, env_state
 
             rollout_states = []
-            render_env_last = None
             for i in range(args.num_render):
-                render_env = make_env(args.eval_env_id)
-                render_env_last = render_env
+                env = make_env(args.eval_env_id)
                 rng = jax.random.PRNGKey(seed=i + 1)
-                render_env_state = jax.jit(render_env.reset)(rng)
+                env_state = jax.jit(env.reset)(rng)
                 for _ in range(args.vis_length):
-                    render_env_state, current_state = policy_step(
-                        render_env_state, training_state.actor_state.params
+                    env_state, current_state = policy_step(
+                        env_state, training_state.actor_state.params
                     )
                     rollout_states.append(current_state.pipeline_state)
 
-            sys = render_env_last.sys if render_env_last is not None else env.sys
-            html_string = html.render(sys, rollout_states)
+            html_string = html.render(env.sys, rollout_states)
             render_path = save_path_local / "vis.html"
             with open(render_path, "w") as f:
                 f.write(html_string)
@@ -538,7 +537,7 @@ if __name__ == "__main__":
                 if args.wandb_mode == "offline" and trigger_sync is not None:
                     trigger_sync()
 
-        print("Rendering final policy for wandb...", flush=True)
+        print("Rendering final policy (vis.html)...", flush=True)
         try:
             render_policy(training_state, save_path)
         except Exception as e:

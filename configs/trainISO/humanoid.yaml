@@ -1,0 +1,32 @@
+slurm:
+  job_name: jaxISO_humanoid
+  output: logs/%x/%j.log
+  error: logs/%x/%j.err
+  nodes: 1
+  ntasks: 1
+  cpus_per_task: 10
+  mem: 40G
+  time: "72:00:00"
+  partition: compsci-gpu
+  gres: gpu:a5000:1
+
+env:
+  # Use 90% of GPU memory (default 75% is too conservative for large models)
+  XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
+  # Match JAX codegen to Ampere A5000 (avoid Hopper-only PTX when possible)
+  JAX_CUDA_ARCH_LIST: "8.6"
+
+args:
+  wandb_mode: online
+  env_id: humanoid
+  eval_env_id: humanoid
+  num_epochs: 100
+  total_env_steps: 1000000000
+  actor_depth: 64
+  actor_skip_connections: 4
+  actor_network_width: 256
+  batch_size: 512
+  actor_embed_reg: true
+  vis_length: 1000
+  save_buffer: 0
+  capture_vis: true

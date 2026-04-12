@@ -1,0 +1,42 @@
+# W&B online (live sync). For offline logging + sync later, use wandb_mode: offline.
+slurm:
+  job_name: iso_SAC_humanoid
+  output: logs/%x_%j.log
+  error: logs/%x_%j.err
+  nodes: 1
+  ntasks: 1
+  cpus_per_task: 10
+  mem: 50G
+  time: "48:00:00"
+  partition: compsci-gpu
+  # JAX 0.4.23 targets up to Hopper PTX; use A5000 (sm_86) to avoid Blackwell PTX errors.
+  gres: gpu:a5000:1
+
+env:
+  XLA_PYTHON_CLIENT_MEM_FRACTION: "0.9"
+  JAX_CUDA_ARCH_LIST: "8.6"
+
+args:
+  wandb_mode: online
+  env_id: humanoid
+  eval_env_id: humanoid
+  num_epochs: 100
+  total_env_steps: 100000000
+  critic_depth: 64
+  actor_depth: 64
+  actor_skip_connections: 4
+  critic_skip_connections: 4
+  critic_network_width: 256
+  actor_network_width: 256
+  batch_size: 512
+  vis_length: 1000
+  save_buffer: 0
+  unified_encoder: true
+  # ISO actor: push trunk embedding toward isotropic Gaussian N(0,1)
+  iso_actor: true
+  actor_reg_coeff: 0.05
+  sigreg_iso_num_slices: 16
+  sigreg_iso_num_t: 8
+  sigreg_iso_t_max: 5.0
+  # Optional: also regularize the critic with SIGReg
+  # sigreg: true

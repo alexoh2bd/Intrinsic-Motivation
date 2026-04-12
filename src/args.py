@@ -90,6 +90,12 @@ class Args:
     # Actor embedding regularization (SIGReg on backbone output before action heads)
     actor_embed_reg: bool = False
     actor_reg_coeff: float = 0.05
+    # ISO actor: use sigreg_iso (isotropic Gaussian matching) instead of sigreg_forward
+    # sigreg_iso is parameter-free; implies actor_embed_reg=True
+    iso_actor: bool = False
+    sigreg_iso_num_slices: int = 16
+    sigreg_iso_num_t: int = 8
+    sigreg_iso_t_max: float = 5.0
 
     # PPO / ISOActor specific
     ppo_clip_coef: float = 0.2

@@ -35,7 +35,7 @@ from src.networks import (
 from src.types import TrainingState, Transition
 from src.utils import load_params, save_params
 from src.env_factory import make_env as _make_env
-from src.loss import SIGRegModule, lejepa_loss, sigreg_forward, tri_loss
+from src.loss import SIGRegModule, lejepa_loss, sigreg_forward, sigreg_iso, tri_loss
 from src.evaluator import CrlEvaluator
 from src.buffer import TrajectoryUniformSamplingQueue
 
@@ -128,8 +128,11 @@ class Args:
     # Actor embedding regularization (SIGReg on backbone output before action heads)
     actor_embed_reg: bool = False
     actor_reg_coeff: float = 0.05
-
-
+    # ISO actor: sigreg_iso (isotropic Gaussian) instead of sigreg_forward; parameter-free
+    iso_actor: bool = False
+    sigreg_iso_num_slices: int = 16
+    sigreg_iso_num_t: int = 8
+    sigreg_iso_t_max: float = 5.0
 
 
 # Network classes (UnifiedEncoder, SA_encoder, G_encoder, Actor),
@@ -245,7 +248,8 @@ if __name__ == "__main__":
     )
 
     # Actor embedding SIGReg params (separate from critic's sigreg_params)
-    if args.actor_embed_reg:
+    # iso_actor uses sigreg_iso which is parameter-free, so no params needed
+    if args.actor_embed_reg and not args.iso_actor:
         sigreg_params_actor = SIGRegModule.init_sigreg_params(knots=17)
 
     # Critic — architecture choice (unified vs. separate encoders)
@@ -542,13 +546,23 @@ if __name__ == "__main__":
             # Actor loss: maximise Q (minimise distance)
             actor_loss = -jnp.mean(qf_pi)
 
-            # Actor embedding SIGReg: diversify backbone representations
-            # before the action heads to prevent embedding collapse
+            # Actor embedding regularization: diversify backbone representations
+            # before the action heads to prevent embedding collapse.
+            # iso_actor: push toward isotropic Gaussian N(0,1) (parameter-free)
+            # actor_embed_reg: learned SIGReg with sigreg_params_actor
             actor_sigreg_loss = jnp.float32(0.0)
-            if args.actor_embed_reg:
-                actor_sigreg_loss = sigreg_forward(
-                    actor_embedding, sigreg_params_actor, sig_key1
-                )
+            if args.iso_actor or args.actor_embed_reg:
+                if args.iso_actor:
+                    actor_sigreg_loss = sigreg_iso(
+                        actor_embedding, sig_key1,
+                        num_slices=args.sigreg_iso_num_slices,
+                        num_t=args.sigreg_iso_num_t,
+                        t_max=args.sigreg_iso_t_max,
+                    )
+                else:
+                    actor_sigreg_loss = sigreg_forward(
+                        actor_embedding, sigreg_params_actor, sig_key1
+                    )
                 actor_loss = actor_loss + args.actor_reg_coeff * actor_sigreg_loss
 
             if not args.disable_entropy:
