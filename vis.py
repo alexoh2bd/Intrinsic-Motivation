@@ -20,6 +20,8 @@ Usage
         --args-path    runs/humanoid_1000.../args.pkl \
         --wandb-run-id <existing-run-id>
 
+# GIF playback defaults to 5× real-time (--playback-speedup 5). Use --fps N for exact frame rate.
+
 Network type detection
 -----------------------
 trainISO.py  saves actor_state.params directly  → a plain dict pytree → ISOActor
@@ -29,24 +31,117 @@ Pass --network-type iso|crl to force, or leave as "auto".
 
 from __future__ import annotations
 
+import gc
+import io
 import pickle
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import jax
-import jax.numpy as jnp
 import flax.linen as nn
+import mujoco
 import numpy as np
 import wandb
 from brax import envs
-from brax.io import image
+from PIL import Image
 
 from src.args import Args
 from src.env_factory import make_env as _make_env
 from src.networks import Actor, ISOActor
 from src.utils import load_params
+
+
+def _patch_mujoco_renderer_close() -> None:
+    """MuJoCo Renderer.__init__ can fail after _gl_context but before _mjr_context.
+
+    The stock close()/__del__ then raises AttributeError. Patch close to use getattr.
+    """
+    _orig = mujoco.Renderer.close
+
+    def _safe_close(self) -> None:
+        gl = getattr(self, "_gl_context", None)
+        if gl is not None:
+            try:
+                gl.free()
+            except Exception:
+                pass
+        self._gl_context = None
+        mjr = getattr(self, "_mjr_context", None)
+        if mjr is not None:
+            try:
+                mjr.free()
+            except Exception:
+                pass
+        self._mjr_context = None
+
+    mujoco.Renderer.close = _safe_close  # type: ignore[assignment]
+
+
+_patch_mujoco_renderer_close()
+
+
+def _gif_frame_duration_ms(system, playback_speedup: float, fps: Optional[int]) -> float:
+    """Milliseconds per GIF frame. fps overrides; else dt / playback_speedup."""
+    if fps is not None:
+        return 1000.0 / float(fps)
+    dt_ms = float(np.asarray(system.dt)) * 1000.0
+    return dt_ms / float(playback_speedup)
+
+
+def _render_gif_bytes(
+    system,
+    trajectory: list,
+    height: int,
+    width: int,
+    camera: Optional[object] = None,
+    *,
+    playback_speedup: float = 1.0,
+    fps: Optional[int] = None,
+) -> bytes:
+    """Like brax.io.image.render(fmt='gif') but closes Renderer in finally.
+
+    Stock brax leaves Renderer to __del__, which can interact badly with EGL/OSMesa
+    teardown (libc++abi recursive init) on GPU/headless clusters.
+    """
+    if not trajectory:
+        raise RuntimeError("must have at least one state")
+
+    renderer = mujoco.Renderer(system.mj_model, height=height, width=width)
+    try:
+        cam = camera if camera is not None else -1
+        frames_np = []
+        for state in trajectory:
+            d = mujoco.MjData(system.mj_model)
+            q = np.asarray(state.q)
+            qd = np.asarray(state.qd)
+            d.qpos, d.qvel = q, qd
+            mujoco.mj_forward(system.mj_model, d)
+            renderer.update_scene(d, camera=cam)
+            frames_np.append(renderer.render())
+    finally:
+        try:
+            renderer.close()
+        except Exception:
+            pass
+
+    duration_ms = _gif_frame_duration_ms(system, playback_speedup, fps)
+
+    frames = [Image.fromarray(arr) for arr in frames_np]
+    buf = io.BytesIO()
+    if len(frames) == 1:
+        frames[0].save(buf, format="gif")
+    else:
+        frames[0].save(
+            buf,
+            format="gif",
+            append_images=frames[1:],
+            save_all=True,
+            duration=duration_ms,
+            loop=0,
+        )
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +180,16 @@ class VisConfig:
     seed: int = 42
 
     # ── Render settings ─────────────────────────────────────────────────────
-    width: int = 480
-    height: int = 640
+    # MuJoCo defaults offscreen framebuffer to 640×480; larger requests raise
+    # before Renderer finishes init (and can trigger a noisy __del__ bug).
+    width: int = 640
+    height: int = 480
     camera: Optional[str] = None
     """Camera name (None = MuJoCo default)."""
+    playback_speedup: float = 5.0
+    """GIF plays this many times faster than real-time (env dt). Ignored if --fps is set."""
     fps: Optional[int] = None
-    """Override GIF framerate. None = use brax's default (1 / dt)."""
+    """If set, GIF frame duration = 1/fps seconds (overrides playback_speedup)."""
 
     # ── W&B settings ────────────────────────────────────────────────────────
     wandb_project: str = "JaxGCRL_testing"
@@ -162,6 +261,20 @@ def _deterministic_action(actor, actor_params, obs, network_type: str):
     return nn.tanh(means)
 
 
+def _clamp_render_to_framebuffer(sys, width: int, height: int) -> tuple[int, int]:
+    """MuJoCo.Renderer requires width/height ≤ model.vis.global_ offscreen buffer."""
+    mj = sys.mj_model
+    max_w = int(mj.vis.global_.offwidth)
+    max_h = int(mj.vis.global_.offheight)
+    w, h = min(width, max_w), min(height, max_h)
+    if w != width or h != height:
+        print(
+            f"  Clamping render size {width}×{height} to framebuffer {max_w}×{max_h} → {w}×{h}",
+            flush=True,
+        )
+    return w, h
+
+
 # ---------------------------------------------------------------------------
 # Core rollout + render
 # ---------------------------------------------------------------------------
@@ -186,7 +299,10 @@ def render_episodes(
 
     for ep in range(cfg.num_render):
         env = _make_env_from_cfg(args.eval_env_id or args.env_id, args)
-        rng = jax.random.PRNGKey(cfg.seed + ep)
+        # Brax training.wrap adds VmapWrapper: reset is vmapped over the leading
+        # RNG axis. A bare PRNGKey has shape (2,); vmap would split the key into
+        # two scalars. Use split(..., 1) so shape is (1, *key) for a single env.
+        rng = jax.random.split(jax.random.PRNGKey(cfg.seed + ep), 1)
         env_state = jax.jit(env.reset)(rng)
 
         episode_states = []
@@ -196,21 +312,43 @@ def render_episodes(
 
         print(f"  episode {ep}: rendering {len(episode_states)} frames...", flush=True)
 
-        render_kwargs: dict = dict(height=cfg.height, width=cfg.width)
+        rw, rh = _clamp_render_to_framebuffer(env.sys, cfg.width, cfg.height)
+        render_kwargs: dict = dict(height=rh, width=rw)
         if cfg.camera is not None:
             render_kwargs["camera"] = cfg.camera
 
         try:
-            gif_bytes = image.render(env.sys, episode_states, fmt="gif", **render_kwargs)
+            gif_bytes = _render_gif_bytes(
+                env.sys,
+                episode_states,
+                height=render_kwargs["height"],
+                width=render_kwargs["width"],
+                camera=render_kwargs.get("camera"),
+                playback_speedup=cfg.playback_speedup,
+                fps=cfg.fps,
+            )
         except Exception as e:
-            print(f"  WARNING: brax.io.image.render failed for episode {ep}: {e}", flush=True)
-            print("  Hint: headless rendering needs OSMesa / EGL (apt: libosmesa6 or libgl1-mesa-glx).", flush=True)
+            print(f"  WARNING: GIF render failed for episode {ep}: {e}", flush=True)
+            err = str(e).lower()
+            if "framebuffer" in err or "offwidth" in err or "offheight" in err:
+                print(
+                    "  Hint: use --width/--height within the model framebuffer, or add "
+                    "<visual><global offwidth=\"...\" offheight=\"...\"/></visual> to the env XML.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "  Hint: headless/GPU nodes: try export MUJOCO_GL=egl (GPU) or "
+                    "MUJOCO_GL=osmesa (CPU offscreen); ensure libGL/OSMesa/EGL is installed.",
+                    flush=True,
+                )
             continue
 
         gif_path = gif_dir / f"episode_{ep:03d}.gif"
         gif_path.write_bytes(gif_bytes)
         print(f"  saved → {gif_path}", flush=True)
         gif_paths.append(gif_path)
+        gc.collect()
 
     return gif_paths
 

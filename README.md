@@ -75,12 +75,23 @@ src/
 
 ### Results
 
-![Preliminary results](/assets/preliminary_results.png)
+![Humanoid evaluation success rate across training steps](./results/results0.png)
 
 **Humanoid** evaluation success rate across training steps. 
 - Green (on-policy): Isotropic On-Policy (PPO + `sigreg_iso` actor, `trainISO.py`). 
 - Blue (off-policy): original 1000-layer SSLRL baseline (`train.py`, no ISO regularization). 
 - Red (off-policy): SAC with isotropic policy and contrastive critic (`train.py --iso_actor`).
+
+#### Rollout comparison (`train.py` vs `trainISO.py`)
+
+Same environment (Humanoid), first saved rollout episode from `vis.py` for each policy checkpoint:
+
+<p align="center">
+  <img src="./assets/gifs/train/episode_000.gif" alt="Off-policy SAC + contrastive CRL (train.py)" width="49%" />
+  <img src="./assets/gifs/trainISO/episode_000.gif" alt="On-policy PPO + ISO actor (trainISO.py)" width="49%" />
+</p>
+
+<p align="center"><sub><strong>Left:</strong> <code>train.py</code> · <strong>Right:</strong> <code>trainISO.py</code></sub></p>
 
 ### Running experiments
 
