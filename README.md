@@ -1,21 +1,122 @@
-# 1000 Layer Networks for Self-Supervised RL: Scaling Depth Can Enable New Goal-Reaching Capabilities
+# Scaling Goal-Conditioned Reinforcement Learning
 
-<p align="center">
-    <a href= "https://arxiv.org/abs/2503.14858">
-        <img src="https://img.shields.io/badge/arXiv-2311.10090-b31b1b.svg" /></a>
-    <a href= "https://github.com/wang-kevin3290/scaling-crl/blob/master/LICENSE">
-        <img src="https://img.shields.io/badge/license-Apache2.0-blue.svg" /></a>
-    <a href= "https://wang-kevin3290.github.io/scaling-crl/">
-        <img src="https://img.shields.io/badge/website-purple" /></a>
-</p>
-
-> [!IMPORTANT]  
-> [Our work was selected for the Best Paper Award at NeurIPS 2025!](https://blog.neurips.cc/2025/11/26/announcing-the-neurips-2025-best-paper-awards/#:~:text=1000%20Layer%20Networks%20for%20Self%2DSupervised%20RL%3A%20Scaling%20Depth%20Can%20Enable%20New%20Goal%2DReaching%20Capabilities) 🥳
-
-Email kw6487@princeton.edu with questions/comments/suggestions.
+**Weights & Biases:** [api.wandb.ai/links/aho13-duke-university/x91o1azt](https://api.wandb.ai/links/aho13-duke-university/x91o1azt)
 
 ![Environments](assets/envs.gif)
 Our work builds on top of [JAXGCRL](https://github.com/MichalBortkiewicz/JaxGCRL), feel free to check it out!!
+
+## Research extensions (this fork)
+
+This repository is a research fork of [Scaling CRL](https://github.com/wang-kevin3290/scaling-crl) (Wang et al., NeurIPS 2025 Best Paper). It investigates how to combine the **depth-scaling** insights from that paper with **isotropic Gaussian representation regularization** introduced by Obando-Ceron et al. (2026) [[arXiv:2602.19373](https://arxiv.org/abs/2602.19373)] and the original SIGReg technique from the LeJEPA / Scaling-CRL work [[arXiv:2503.14858](https://arxiv.org/abs/2503.14858)].
+
+### Motivation
+
+Wang et al. (2025) showed that very deep residual networks (up to 1024 layers) dramatically improve performance on unsupervised goal-conditioned RL tasks. However, as networks grow deeper, **representation collapse** and **neuron dormancy** become increasingly problematic. Obando-Ceron et al. (2026) proved theoretically that isotropic Gaussian embeddings are provably advantageous under the non-stationarity inherent in RL: they induce stable tracking of time-varying targets, achieve maximal entropy under a fixed variance budget, and encourage balanced use of all representational dimensions. Their proposed regularizer, **Sketched Isotropic Gaussian Regularization (SIGReg-ISO)**, is parameter-free — it pushes the empirical characteristic function of 1-D sliced projections of an embedding batch to match that of `N(0,1)`.
+
+**Our core hypothesis:** applying this parameter-free isotropic Gaussian regularizer to the actor trunk of a deep CRL network will reduce collapse at scale and improve policy learning stability, providing a stronger foundation for further depth scaling.
+
+### Experiments
+
+#### 1. ISO actor in off-policy SAC/CRL (`train.py`)
+
+The main experiment integrates `sigreg_iso` as an **actor trunk regularizer** within the standard SAC + contrastive critic training loop.
+
+- **`--iso_actor`**: enables the parameter-free `sigreg_iso` loss on the actor's backbone embedding before the action heads (Obando-Ceron et al., 2026).
+- **`--actor_embed_reg`**: the original learned SIGReg-forward path (knot-based, parameterized) for comparison.
+- Both paths scale the regularization contribution by `--actor_reg_coeff` (default `0.05`).
+
+`sigreg_iso` hyperparameters:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--sigreg_iso_num_slices` | `16` | Number of random 1-D projection directions |
+| `--sigreg_iso_num_t` | `8` | Points on the characteristic-function evaluation grid |
+| `--sigreg_iso_t_max` | `5.0` | Grid spans `[-t_max, t_max]` |
+
+#### 2. ISO actor in on-policy PPO (`trainISO.py`)
+
+A PPO training loop with an `ISOActor` backbone and `sigreg_iso` applied to the policy trunk at every update step. This tests the same regularization hypothesis under an on-policy learning regime.
+
+#### 3. Frozen-critic actor training (`train_frozen_critic.py`)
+
+Freeze a pretrained deep critic (trained with InfoNCE or SIGReg) and train a fresh deep actor from scratch against the fixed Q-landscape. This isolates **how much of the performance gain from depth comes from the critic's representation** versus the actor, and tests whether a good deep critic can bootstrap a good actor even when the actor starts from random weights.
+
+### Embedding analysis (`src/embedding_metrics.py`)
+
+To understand *why* regularization helps or hurts, we track a suite of representation-quality metrics logged during training:
+
+| Metric | What it measures |
+|--------|-----------------|
+| `effective_rank` | Roy & Vetterli (2007) — exp(entropy of normalized singular value distribution); proxy for representation capacity actually used |
+| `numerical_rank` | Count of singular values above 1% of max; hard rank estimate |
+| `isotropy_score` | min / max eigenvalue of the covariance matrix; 1.0 = perfectly isotropic |
+| `participation_ratio` | `(Σλ_i)² / Σλ_i²`; another rank proxy robust to small singular values |
+| `two_nn_intrinsic_dim` | Facco et al. (2017) two-nearest-neighbor estimator of the manifold dimension |
+| `alignment` | Mean L2 distance between matched `(s,a)` and goal embedding pairs |
+| `uniformity` | Wang & Isola (2020) log-mean-exp metric on pairwise distances; measures spread |
+| `pos_neg_ratio` | Mean positive-pair distance / mean negative-pair distance; should be ≪ 1 |
+
+### Codebase structure
+
+Code is factored into `src/` for clean reuse across training scripts:
+
+```
+src/
+  args.py              # All CLI flags (shared across train.py / trainISO.py)
+  networks.py          # UnifiedEncoder, SA_encoder, G_encoder, Actor, ISOActor
+  loss.py              # sigreg_forward, sigreg_iso (SIGReg-ISO), lejepa_loss, SIGRegModule
+  buffer.py            # Trajectory replay buffer
+  evaluator.py         # Goal-conditioned success evaluator
+  env_factory.py       # Brax environment construction
+  embedding_metrics.py # Representation quality diagnostics
+  types.py             # TrainingState, ISOTrainingState, Transition
+  utils.py             # Checkpoint save/load
+```
+
+### Results
+
+![Preliminary results](/assets/preliminary_results.png)
+
+**Humanoid** evaluation success rate across training steps. 
+- Green (on-policy): Isotropic On-Policy (PPO + `sigreg_iso` actor, `trainISO.py`). 
+- Blue (off-policy): original 1000-layer SSLRL baseline (`train.py`, no ISO regularization). 
+- Red (off-policy): SAC with isotropic policy and contrastive critic (`train.py --iso_actor`).
+
+### Running experiments
+
+**YAML-based SLURM submission** (recommended on a cluster):
+
+```sh
+# Preview the generated sbatch script without submitting
+python scripts/slurm_from_yaml.py configs/train/humanoid_iso.yaml train.py --dry-run
+
+# Submit to SLURM
+python scripts/slurm_from_yaml.py configs/train/humanoid_iso.yaml train.py
+python scripts/slurm_from_yaml.py configs/trainISO/humanoid.yaml trainISO.py
+```
+
+**Example configs**:
+
+| Config | Setup |
+|--------|-------|
+| `configs/train/humanoid_iso.yaml` | Humanoid, SAC + deep network, `iso_actor` (parameter-free SIGReg-ISO on actor trunk) |
+| `configs/train/humanoid_offline_sigreg_actor_infonce.yaml` | Humanoid, SAC, learned SIGReg-forward on actor, InfoNCE critic (offline W&B logging) |
+| `configs/train/reacher.yaml` | Reacher baseline, shallow network |
+| `configs/trainISO/humanoid.yaml` | Humanoid, PPO + ISOActor + `sigreg_iso` on policy backbone |
+
+### Citation for SIGReg-ISO
+
+If this work is useful to you, please also cite the SIGReg-ISO paper:
+
+```bibtex
+@article{obando2026stable,
+  title   = {Stable Deep Reinforcement Learning via Isotropic Gaussian Representations},
+  author  = {Obando-Ceron, Johan and others},
+  journal = {arXiv preprint arXiv:2602.19373},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2602.19373}
+}
+```
 
 # Installation
 
